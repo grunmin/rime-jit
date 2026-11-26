@@ -68,8 +68,11 @@ private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
     // 打字时反而每帧都跑 OCR；8% 让"正在打字"稳定走跳过路径，翻页仍然远超这条线。
     private var lastTiles: [UInt64]?
     private var skippedFrames = 0
+    // 实测（16x16 网格、1 fps、真实打拼音 + 候选框）：打字帧脏格中位数 1.6%、
+    // p90 3.5%、最大 5.9%，离 8% 还有余量，所以跳过的安全性由时间上限兜底。
+    // 8 帧（约 8 秒）在新消息这类 1-3% 的小更新上等待过久，压到 3 帧。
     private static let dirtyThreshold = 0.08
-    private static let maxSkippedFrames = 8
+    private static let maxSkippedFrames = 3
     private var stream: SCStream?
     private var starting = false
     let update: ([Entry]) -> Void
