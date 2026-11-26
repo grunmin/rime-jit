@@ -64,9 +64,11 @@ private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
     private var lastLines: [String]?
     // 打字时输入框里的拼音、光标每按一键都在动，整帧哈希每秒都不同，所以按"脏了多少格"判断。
     // 一行文字只脏 1-2 格，翻页、切窗口、滚动会脏一大片。
+    // 阈值取 8%：输入行 + 横排候选条同时重绘约脏 5-8%，5% 会被击穿，
+    // 打字时反而每帧都跑 OCR；8% 让"正在打字"稳定走跳过路径，翻页仍然远超这条线。
     private var lastTiles: [UInt64]?
     private var skippedFrames = 0
-    private static let dirtyThreshold = 0.05
+    private static let dirtyThreshold = 0.08
     private static let maxSkippedFrames = 8
     private var stream: SCStream?
     private var starting = false
