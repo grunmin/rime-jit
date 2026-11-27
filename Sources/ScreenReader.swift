@@ -3,8 +3,7 @@ import ScreenCaptureKit
 import Vision
 
 enum Recognition {
-    static func lines(using handler: VNImageRequestHandler) throws -> [String] {
-        let request = VNRecognizeTextRequest()
+    static func lines(using handler: VNImageRequestHandler, request: VNRecognizeTextRequest) throws -> [String] {
         // .fast 认不出中文（本机 macOS 27.2 / Vision rev3 实测整行返回空），只能用于英文。
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
@@ -57,11 +56,55 @@ enum FrameDiff {
     }
 }
 
-// Each capture session owns its queue and tokenizer. Drop results from stopped sessions in the UI.
+// 每次 composition 都会新建一个 DisplayReader（新 SCStream），连续打字时每个词提交一次就是一次重建。
+// 新流的第一帧没有"上一帧"可比，过去总是整屏 OCR，几十个短 composition 就排队几十次整屏 OCR，
+// 打完字还要继续算十几秒。这里把上一次的画面指纹和识别结果按显示器留在进程里，
+// 新会话的第一帧只要和它差异小就直接复用，不再 OCR。
+private final class DisplayMemory {
+    struct State {
+        var tiles: [UInt64]
+        var lines: [String]?
+        var entries: [Entry]
+        var skippedFrames: Int
+        var date: Date
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var states: [CGDirectDisplayID: State] = [:]
+    // 超过这个时间的结果不再复用，避免久未输入后拿旧画面凑数。
+    static let maxAge: TimeInterval = 60
+
+    static func load(_ id: CGDirectDisplayID) -> State? {
+        lock.lock(); defer { lock.unlock() }
+        guard let state = states[id], Date().timeIntervalSince(state.date) < maxAge else { return nil }
+        return state
+    }
+
+    static func save(_ id: CGDirectDisplayID, _ state: State) {
+        lock.lock(); defer { lock.unlock() }
+        states[id] = state
+    }
+
+    static func clear(_ id: CGDirectDisplayID) {
+        lock.lock(); defer { lock.unlock() }
+        states.removeValue(forKey: id)
+    }
+}
+
+// 所有显示器、所有会话共用一条识别队列：任何时刻最多一个 OCR 在跑，
+// 不会因为会话重建而出现多个整屏 OCR 并发抢 CPU/ANE。
+private let recognitionQueue = DispatchQueue(label: "RimeScreenWords.recognition", qos: .utility)
+
+// Each capture session owns its tokenizer. Drop results from stopped sessions in the UI.
 private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
-    private let queue = DispatchQueue(label: "RimeScreenWords.recognition", qos: .utility)
+    private let queue = recognitionQueue
     private let index = WordIndex()
+    private let displayID: CGDirectDisplayID
+    // 已停止的会话：丢弃排队中的帧，并取消正在跑的 OCR。
+    private let stateLock = NSLock()
+    private var isStopped = false
+    private var activeRequest: VNRecognizeTextRequest?
     private var lastLines: [String]?
+    private var lastEntries: [Entry] = []
     // 打字时输入框里的拼音、光标每按一键都在动，整帧哈希每秒都不同，所以按"脏了多少格"判断。
     // 一行文字只脏 1-2 格，翻页、切窗口、滚动会脏一大片。
     // 阈值取 8%：输入行 + 横排候选条同时重绘约脏 5-8%，5% 会被击穿，
@@ -78,9 +121,37 @@ private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
     let update: ([Entry]) -> Void
     let failure: (Error) -> Void
 
-    init(update: @escaping ([Entry]) -> Void, failure: @escaping (Error) -> Void) {
+    init(displayID: CGDirectDisplayID, update: @escaping ([Entry]) -> Void, failure: @escaping (Error) -> Void) {
+        self.displayID = displayID
         self.update = update
         self.failure = failure
+        super.init()
+        if let state = DisplayMemory.load(displayID) {
+            lastTiles = state.tiles
+            lastLines = state.lines
+            lastEntries = state.entries
+            skippedFrames = state.skippedFrames
+        }
+    }
+
+    private var stopped: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return isStopped
+    }
+
+    private func markStopped() {
+        stateLock.lock()
+        isStopped = true
+        let request = activeRequest
+        stateLock.unlock()
+        request?.cancel()
+    }
+
+    private func setActive(_ request: VNRecognizeTextRequest?) -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        if isStopped { return false }
+        activeRequest = request
+        return true
     }
 
     @MainActor func start(filter: SCContentFilter) async throws {
@@ -104,6 +175,7 @@ private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     @MainActor func stop() async {
+        markStopped()
         let capture = stream
         stream = nil
         if !starting { try? await capture?.stopCapture() }
@@ -114,7 +186,7 @@ private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, sample.isValid,
+        guard !stopped, type == .screen, sample.isValid,
               let data = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
                 as? [[SCStreamFrameInfo: Any]],
               let raw = data.first?[.status] as? Int, let status = SCFrameStatus(rawValue: raw)
@@ -131,20 +203,48 @@ private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
                    FrameDiff.dirtyRatio(tiles, previous) < Self.dirtyThreshold,
                    skippedFrames < Self.maxSkippedFrames {
                     skippedFrames += 1
+                    // 新会话第一次命中复用：快照在上一次 composition 结束时被清掉了，要重新发布。
+                    publishIfNeeded()
+                    remember()
                     return
                 }
                 skippedFrames = 0
-                lines = try Recognition.lines(using: VNImageRequestHandler(cvPixelBuffer: buffer))
+                let request = VNRecognizeTextRequest()
+                guard setActive(request) else { return }
+                defer { _ = setActive(nil) }
+                lines = try Recognition.lines(using: VNImageRequestHandler(cvPixelBuffer: buffer), request: request)
+                // OCR 期间会话可能已结束，结果不再有用，也不能写进复用缓存。
+                if stopped { return }
             } else {
                 lines = []
             }
-            guard lines != lastLines else { return }
-            lastLines = lines
-            let entries = index.entries(lines: lines)
-            DispatchQueue.main.async { self.update(entries) }
+            if lines != lastLines {
+                lastLines = lines
+                lastEntries = index.entries(lines: lines)
+                published = false
+            }
+            publishIfNeeded()
+            remember()
         } catch {
+            if stopped { return }
             DispatchQueue.main.async { self.failure(error) }
         }
+    }
+
+    // 本会话是否已把 lastEntries 发给 UI（新会话的快照是空的，必须至少发一次）。
+    private var published = false
+
+    private func publishIfNeeded() {
+        guard !published else { return }
+        published = true
+        let entries = lastEntries
+        DispatchQueue.main.async { self.update(entries) }
+    }
+
+    private func remember() {
+        guard let tiles = lastTiles else { return }
+        DisplayMemory.save(displayID, .init(tiles: tiles, lines: lastLines, entries: lastEntries,
+                                            skippedFrames: skippedFrames, date: Date()))
     }
 }
 
@@ -213,7 +313,7 @@ final class ScreenReader {
             }
             guard errors[id] == nil else { continue }
             let token = UUID()
-            let reader = DisplayReader(update: { [weak self] entries in
+            let reader = DisplayReader(displayID: id, update: { [weak self] entries in
                 guard let self, self.captures[id]?.id == token else { return }
                 self.words[id] = entries
                 self.publish()
