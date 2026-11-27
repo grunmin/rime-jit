@@ -65,7 +65,7 @@ private final class DisplayMemory {
         var tiles: [UInt64]
         var lines: [String]?
         var entries: [Entry]
-        var skippedFrames: Int
+        var lastOCR: Date
         var date: Date
     }
     private static let lock = NSLock()
@@ -99,23 +99,22 @@ private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
     private let queue = recognitionQueue
     private let index = WordIndex()
     private let displayID: CGDirectDisplayID
-    // 已停止的会话：丢弃排队中的帧，并取消正在跑的 OCR。
+    // 已停止的会话：丢弃排队中的帧。正在跑的 OCR 不取消：会话通常比一次 OCR（1~3 秒）还短，
+    // 取消等于白算，下一个会话又从零开始；让它跑完，结果写进 DisplayMemory 供下一个会话复用。
     private let stateLock = NSLock()
     private var isStopped = false
-    private var activeRequest: VNRecognizeTextRequest?
     private var lastLines: [String]?
     private var lastEntries: [Entry] = []
     // 打字时输入框里的拼音、光标每按一键都在动，整帧哈希每秒都不同，所以按"脏了多少格"判断。
     // 一行文字只脏 1-2 格，翻页、切窗口、滚动会脏一大片。
-    // 阈值取 8%：输入行 + 横排候选条同时重绘约脏 5-8%，5% 会被击穿，
-    // 打字时反而每帧都跑 OCR；8% 让"正在打字"稳定走跳过路径，翻页仍然远超这条线。
+    // 阈值取 12%：2026-11-27 在 4K 屏上实测（修好像素格式后第一次真正量到），
+    // 打字帧脏格 3.5%~9.4%，8% 会被击穿，打字时仍频繁整屏 OCR；翻页、切窗口实测 35% 左右，余量足够。
     private var lastTiles: [UInt64]?
-    private var skippedFrames = 0
-    // 实测（16x16 网格、1 fps、真实打拼音 + 候选框）：打字帧脏格中位数 1.6%、
-    // p90 3.5%、最大 5.9%，离 8% 还有余量，所以跳过的安全性由时间上限兜底。
-    // 8 帧（约 8 秒）在新消息这类 1-3% 的小更新上等待过久，压到 3 帧。
-    private static let dirtyThreshold = 0.08
-    private static let maxSkippedFrames = 3
+    private var lastOCR = Date.distantPast
+    // 跳过的安全性由时间上限兜底：距上次 OCR 超过 6 秒就重新识别一次。
+    // 用时间而不是帧数：会话是一串短突发，一个会话常常只有 1 帧，按帧数计会随会话重建而失真。
+    private static let dirtyThreshold = 0.12
+    private static let maxSkipSeconds: TimeInterval = 6
     private var stream: SCStream?
     private var starting = false
     let update: ([Entry]) -> Void
@@ -126,11 +125,20 @@ private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
         self.update = update
         self.failure = failure
         super.init()
+    }
+
+    // 复用缓存要等到第一帧到来时再读：上一个会话的 OCR 可能还在共享队列里跑，
+    // 它跑完会写入缓存，而这一帧只有排在它后面才会被处理。
+    private var loadedMemory = false
+
+    private func loadMemory() {
+        guard !loadedMemory else { return }
+        loadedMemory = true
         if let state = DisplayMemory.load(displayID) {
             lastTiles = state.tiles
             lastLines = state.lines
             lastEntries = state.entries
-            skippedFrames = state.skippedFrames
+            lastOCR = state.lastOCR
         }
     }
 
@@ -140,18 +148,8 @@ private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func markStopped() {
-        stateLock.lock()
-        isStopped = true
-        let request = activeRequest
-        stateLock.unlock()
-        request?.cancel()
-    }
-
-    private func setActive(_ request: VNRecognizeTextRequest?) -> Bool {
         stateLock.lock(); defer { stateLock.unlock() }
-        if isStopped { return false }
-        activeRequest = request
-        return true
+        isStopped = true
     }
 
     @MainActor func start(filter: SCContentFilter) async throws {
@@ -162,6 +160,9 @@ private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
         config.height = max(1, Int(filter.contentRect.height * scale))
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
         config.queueDepth = 3
+        // ScreenCaptureKit 默认给 420v（YCbCr 双平面），FrameDiff 只认 BGRA，
+        // 不指定的话 hashes() 永远返回 nil，脏格跳过和跨会话复用都不会生效，每一帧都整屏 OCR。
+        config.pixelFormat = kCVPixelFormatType_32BGRA
         config.showsCursor = false
         config.capturesAudio = false
         let capture = SCStream(filter: filter, configuration: config, delegate: self)
@@ -192,6 +193,7 @@ private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
               let raw = data.first?[.status] as? Int, let status = SCFrameStatus(rawValue: raw)
         else { return }
         if status == .idle || status == .started { return }
+        loadMemory()
         do {
             let lines: [String]
             if status == .complete, let buffer = sample.imageBuffer {
@@ -201,20 +203,15 @@ private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
                 lastTiles = tiles
                 if let tiles, let previous, previous.count == tiles.count,
                    FrameDiff.dirtyRatio(tiles, previous) < Self.dirtyThreshold,
-                   skippedFrames < Self.maxSkippedFrames {
-                    skippedFrames += 1
+                   Date().timeIntervalSince(lastOCR) < Self.maxSkipSeconds {
                     // 新会话第一次命中复用：快照在上一次 composition 结束时被清掉了，要重新发布。
                     publishIfNeeded()
                     remember()
                     return
                 }
-                skippedFrames = 0
-                let request = VNRecognizeTextRequest()
-                guard setActive(request) else { return }
-                defer { _ = setActive(nil) }
-                lines = try Recognition.lines(using: VNImageRequestHandler(cvPixelBuffer: buffer), request: request)
-                // OCR 期间会话可能已结束，结果不再有用，也不能写进复用缓存。
-                if stopped { return }
+                lastOCR = Date()
+                lines = try Recognition.lines(using: VNImageRequestHandler(cvPixelBuffer: buffer),
+                                              request: VNRecognizeTextRequest())
             } else {
                 lines = []
             }
@@ -223,8 +220,9 @@ private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
                 lastEntries = index.entries(lines: lines)
                 published = false
             }
-            publishIfNeeded()
             remember()
+            // OCR 期间会话可能已结束：结果留在缓存里，但不再发布。
+            if !stopped { publishIfNeeded() }
         } catch {
             if stopped { return }
             DispatchQueue.main.async { self.failure(error) }
@@ -244,7 +242,7 @@ private final class DisplayReader: NSObject, SCStreamOutput, SCStreamDelegate {
     private func remember() {
         guard let tiles = lastTiles else { return }
         DisplayMemory.save(displayID, .init(tiles: tiles, lines: lastLines, entries: lastEntries,
-                                            skippedFrames: skippedFrames, date: Date()))
+                                            lastOCR: lastOCR, date: Date()))
     }
 }
 
